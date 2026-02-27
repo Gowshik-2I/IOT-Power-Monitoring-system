@@ -1,0 +1,188 @@
+/**
+ * IoT Power Monitoring System
+ * * Hardware: ESP8266, ACS712 Current Sensor, IR Sensor, Relays (for LED/Fan)
+ * Description: Monitors real-time current and power consumption and syncs 
+ * data bidirectionally with Firebase Realtime Database.
+ */
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ==========================================
+// 🚨 CONFIGURE YOUR CREDENTIALS HERE 🚨
+// DO NOT COMMIT YOUR ACTUAL PASSWORDS TO GITHUB
+// ==========================================
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+#define API_KEY "YOUR_FIREBASE_API_KEY"
+#define DATABASE_URL "YOUR_FIREBASE_DATABASE_URL"
+#define USER_EMAIL "YOUR_FIREBASE_AUTH_EMAIL"
+#define USER_PASSWORD "YOUR_FIREBASE_AUTH_PASSWORD"
+// ==========================================
+
+// COMPONENTS DECLARATION
+#define Led 12
+#define ir 13
+#define fan 14
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config; 
+
+unsigned long readDataPrevMillis = 0;
+int irdata = 0;
+int ledstatus = 0;
+int fanstatus = 0;
+int volt = 230;
+unsigned long sendDataPrevMillis = 0;
+
+// CURRENT SENSOR DECLARATION
+#define ACS_PIN A0
+#define SENSITIVITY 0.066 // 66mV per Amp for the 30A version
+float zeroCurrentVoltage = 2.5;
+#define SAMPLES_PER_CYCLE 100 // Number of samples per AC cycle
+#define AC_FREQUENCY 50 // 50 Hz in India
+
+// Function to calculate the RMS current from the ACS712 sensor
+float getRMSCurrent() {
+  float sumOfSquares = 0;
+  // Sample for at least a few AC cycles to get an accurate reading.
+  // We'll sample for 100ms, which is 5 full 50Hz cycles.
+  unsigned long startTime = millis();
+  int numSamples = 0;
+  
+  while(millis() - startTime < 100) { 
+    int rawReading = analogRead(ACS_PIN);
+    float voltage = (rawReading / 1024.0) * 5.0; 
+    float current = (voltage - zeroCurrentVoltage) / SENSITIVITY;
+    sumOfSquares += current * current;
+    numSamples++;
+  }
+  
+  if (numSamples > 0) {
+    float meanOfSquares = sumOfSquares / numSamples;
+    return sqrt(meanOfSquares);
+  }
+  return 0.0;
+}
+
+void setup() {
+  pinMode(ir, INPUT_PULLUP);
+  pinMode(Led, OUTPUT);
+  pinMode(fan, OUTPUT);
+
+  Serial.begin(115200);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  
+  while(WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println("\nConnected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  
+  config.token_status_callback = tokenStatusCallback;
+  Serial.println("Attempting to sign in with email and password...");
+  Firebase.begin(&config, &auth);
+
+  // Calibrate zero current voltage
+  delay(1000); 
+  float sumOfReadings = 0;
+  for (int i = 0; i < 1000; i++) {
+    sumOfReadings += analogRead(ACS_PIN);
+    delay(1);
+  }
+  float avgReading = sumOfReadings / 1000.0;
+  zeroCurrentVoltage = (avgReading / 1024.0) * 5.0;
+  Serial.print("Calibrated zero current voltage: ");
+  Serial.print(zeroCurrentVoltage);
+  Serial.println("V");
+}
+
+void loop() {
+  if(Firebase.ready() && (millis() - sendDataPrevMillis > 1000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = millis();
+
+    // New, corrected current calculation
+    float current = getRMSCurrent();
+
+    // Apply threshold to filter out noise
+    float currentThreshold = 0.5; // Set a small threshold (e.g., 500mA)
+    if (current < currentThreshold) {
+      current = 0.0;
+    }
+    
+    float power = current * volt;
+    
+    Serial.print("Current: ");
+    Serial.print(current, 2);
+    Serial.println(" A");
+    Serial.print("Power: ");
+    Serial.print(power, 2);
+    Serial.println(" W");
+
+    // IR data sending
+    irdata = digitalRead(ir);
+    String irstatus = (irdata == 1) ? "HIGH" : "LOW";
+    
+    if(Firebase.RTDB.setString(&fbdo, "IR_DATA", irstatus)) {
+      Serial.println();
+      Serial.print("irdata -- Successfully saved " + irstatus + " -> " + fbdo.dataPath() + " " + fbdo.dataType());
+    } else {
+      Serial.println("FAILED: " + fbdo.errorReason());
+    }
+
+    // LED data getting
+    if(Firebase.RTDB.getInt(&fbdo, "LED_STATUS")) {
+      if(fbdo.dataType() == "int") { 
+        ledstatus = fbdo.intData();
+        Serial.println("\nSuccessfully fetched data from " + fbdo.dataPath() + "  " + String(ledstatus));
+        digitalWrite(Led, ledstatus);
+      } else { 
+        Serial.print("\nFetching LED status failed: wrong data type");
+      }
+    }
+
+    // Fan data getting
+    if(Firebase.RTDB.getInt(&fbdo, "FAN_STATUS")) {
+      if(fbdo.dataType() == "int") { 
+        fanstatus = fbdo.intData();
+        Serial.println("\nSuccessfully fetched data from " + fbdo.dataPath() + "  " + String(fanstatus));
+        digitalWrite(fan, fanstatus);
+      } else { 
+        Serial.print("\nFetching Fan status failed: wrong data type");
+      }
+    }
+
+    // Current sending
+    if(Firebase.RTDB.setFloat(&fbdo, "CURRENT_DATA", current)) {
+      Serial.println();
+      Serial.print("current -- Successfully saved -> " + fbdo.dataPath() + " " + fbdo.dataType());
+    } else {
+      Serial.println("FAILED: " + fbdo.errorReason());
+    }
+
+    // Power calculation and sending
+    if(Firebase.RTDB.setFloat(&fbdo, "POWER", power)) {
+      Serial.println();
+      Serial.print("POWER -- Successfully saved -> " + fbdo.dataPath() + " " + fbdo.dataType());
+    } else {
+      Serial.println("FAILED: " + fbdo.errorReason());
+    }
+    Serial.println("\n------------------------------------");
+  } 
+  else if (!Firebase.ready()) {
+    Serial.println("Firebase is not ready yet. Waiting for connection...");
+    delay(1000);
+  }
+}
